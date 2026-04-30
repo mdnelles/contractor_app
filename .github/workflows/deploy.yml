@@ -1,0 +1,123 @@
+name: Deploy DPC Next.js
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  NODE_VERSION: '20'
+  APP_PORT: 4040
+  APP_NAME: dpc-contractor
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Next.js
+        run: npm run build
+
+      - name: Package build artifact
+        run: |
+          tar --exclude='./node_modules/.cache' \
+              -czf dpc-build.tar.gz \
+              .next public package.json package-lock.json next.config.* 2>/dev/null || \
+          tar --exclude='./node_modules/.cache' \
+              -czf dpc-build.tar.gz \
+              .next public package.json package-lock.json
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dpc-build
+          path: dpc-build.tar.gz
+          retention-days: 5
+
+  deploy:
+    name: Deploy → ${{ matrix.target.host }}
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - host: dpc.a3o.co
+            ssh_host_secret: A3O_SSH_HOST
+            ssh_user_secret: A3O_SSH_USER
+            ssh_key_secret:  A3O_SSH_KEY
+          - host: dpc.mikenelles.com
+            ssh_host_secret: MN_SSH_HOST
+            ssh_user_secret: MN_SSH_USER
+            ssh_key_secret:  MN_SSH_KEY
+
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dpc-build
+
+      - name: Configure SSH
+        env:
+          SSH_KEY:  ${{ secrets[matrix.target.ssh_key_secret] }}
+          SSH_HOST: ${{ secrets[matrix.target.ssh_host_secret] }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Upload build to server
+        env:
+          SSH_HOST: ${{ secrets[matrix.target.ssh_host_secret] }}
+          SSH_USER: ${{ secrets[matrix.target.ssh_user_secret] }}
+          DEPLOY_PATH: /var/www/${{ matrix.target.host }}
+        run: |
+          ssh -i ~/.ssh/id_ed25519 "$SSH_USER@$SSH_HOST" \
+            "sudo mkdir -p $DEPLOY_PATH && sudo chown -R $SSH_USER:$SSH_USER $DEPLOY_PATH"
+          scp -i ~/.ssh/id_ed25519 dpc-build.tar.gz "$SSH_USER@$SSH_HOST:$DEPLOY_PATH/"
+
+      - name: Extract, install & restart
+        env:
+          SSH_HOST: ${{ secrets[matrix.target.ssh_host_secret] }}
+          SSH_USER: ${{ secrets[matrix.target.ssh_user_secret] }}
+          DEPLOY_PATH: /var/www/${{ matrix.target.host }}
+          PM2_NAME: ${{ env.APP_NAME }}-${{ matrix.target.host }}
+        run: |
+          ssh -i ~/.ssh/id_ed25519 "$SSH_USER@$SSH_HOST" bash -se <<EOF
+            set -euo pipefail
+            cd "$DEPLOY_PATH"
+            tar -xzf dpc-build.tar.gz
+            rm dpc-build.tar.gz
+            npm ci --omit=dev
+            export PORT=${{ env.APP_PORT }}
+            if command -v pm2 >/dev/null 2>&1; then
+              pm2 describe "$PM2_NAME" >/dev/null 2>&1 \
+                && pm2 restart "$PM2_NAME" --update-env \
+                || pm2 start "npm run start" --name "$PM2_NAME" --update-env
+              pm2 save
+            else
+              sudo systemctl restart "${{ env.APP_NAME }}-${{ matrix.target.host }}.service"
+            fi
+          EOF
+
+      - name: Health check
+        env:
+          SSH_HOST: ${{ secrets[matrix.target.ssh_host_secret] }}
+          SSH_USER: ${{ secrets[matrix.target.ssh_user_secret] }}
+        run: |
+          sleep 5
+          ssh -i ~/.ssh/id_ed25519 "$SSH_USER@$SSH_HOST" \
+            "curl -fsS -o /dev/null -w 'HTTP %{http_code}\n' http://127.0.0.1:${{ env.APP_PORT }}/ || exit 1"
